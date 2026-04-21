@@ -1,0 +1,215 @@
+import argparse
+from tkinter import NO
+import habitat
+import os
+import attr
+import json
+import gzip
+
+from habitat.utils.visualizations.utils import observations_to_image, images_to_video, append_text_to_image
+
+
+def get_success_str(info_success):
+    if int(info_success) == 1:
+        return 'success'
+    else:
+        return 'fail'
+
+
+def write_json(data, path):
+    with open(path, 'w') as file:
+        file.write(json.dumps(data, indent=4))
+
+
+def write_gzip(input_path, output_path):
+    with open(input_path, "rb") as input_file:
+        with gzip.open(output_path + ".gz", "wb") as output_file:
+            output_file.writelines(input_file)
+
+
+def load_dataset(path):
+    with gzip.open(path, "rb") as file:
+        data = json.loads(file.read(), encoding="utf-8")
+    return data
+
+
+def make_metrics(info, episode):
+    ep_json = attr.asdict(episode)
+    ep_json['metrics'] = {
+        'success': int(info['success']),
+        'spl': info['spl'],
+        'distance_to_goal': info['distance_to_goal'],
+        'traj_len': len(episode.reference_replay)
+    }
+    del ep_json['_shortest_path_cache']
+    return ep_json
+
+
+def check_traj_format(args, episode):
+    invalid_format = []
+
+    filename = episode.scene_id
+    replay = episode.reference_replay
+    episode_id = episode.episode_id
+
+    if len(replay) < 2:
+        print(
+            f"Warning: {filename} - Episode {episode_id} has less than 2 actions in reference_replay.")
+        invalid_format.append(
+            f"Episode {episode_id} has less than 2 actions in reference_replay.")
+        return invalid_format
+
+    first_action = replay[0].get('action')
+    if first_action != 'STOP':
+        invalid_format.append(
+            f"Episode {episode_id} first action is not STOP, it is {first_action}")
+        print(
+            f"Warning: {filename} - Episode {episode_id} first action is not STOP, it is {first_action}")
+    
+    #last_action = replay[-1].get('action')
+    #if last_action != 'STOP':
+    #    invalid_format.append(
+    #        f"Episode {episode_id} last action is not STOP, it is {last_action}")
+    #    print(
+    #        f"Warning: {filename} - Episode {episode_id} last action is not STOP, it is {last_action}")
+
+    for step in replay[1:-1]:
+        action = step.get('action')
+        if action not in ['MOVE_FORWARD', 'TURN_LEFT', 'TURN_RIGHT', 'LOOK_UP', 'LOOK_DOWN']:
+            invalid_format.append(
+                f"Episode {episode.get('episode_id')} has invalid action {action}")
+            print(
+                f"Warning: {filename} - Episode {episode.get('episode_id')} has invalid action {action}")
+
+    return invalid_format
+
+
+def traj_replay(args, cfg):
+    scene_name = args.scene_name
+    print(f'process scene {scene_name}')
+    possible_actions = cfg.TASK.POSSIBLE_ACTIONS
+    with habitat.Env(cfg) as env:
+        dataset = load_dataset(cfg.DATASET.DATA_PATH)
+        dataset['episodes'] = []
+        distance_to = cfg.TASK.DISTANCE_TO_GOAL.DISTANCE_TO
+
+        #for ep_id in range(len(env.episodes)):
+        for ep_id in range(5):
+            env.reset()
+            print(f'process episode {ep_id}')
+
+            invalid_format = check_traj_format(args, env.current_episode)
+            if len(invalid_format) > 0:
+                print(f'skip episode {ep_id} due to invalid format')
+                continue
+            episode = env.current_episode
+            info = {}
+
+            observation_list = []
+            closest_goal_object_id = episode.info['closest_goal_object_id']
+            closest_goal_object_position = []
+            for goal in episode.goals:
+                if goal.object_id == closest_goal_object_id:
+                    closest_goal_object_position = goal.position
+                    break
+            closest_goal_object_position = ', '.join(
+                [f'{x:.2f}' for x in closest_goal_object_position])
+
+            num = 0
+            for data in episode.reference_replay[1:]:  # skip the first stop
+                num = num + 1
+                print(f'episode {ep_id} step {num}/{len(episode.reference_replay)-1}')
+                action = possible_actions.index(data["action"])
+                action_name = env.task.get_action_name(
+                    action
+                )
+
+                observations = env.step(action=action)
+
+                info = env.get_metrics()
+                if args.save_video == 'True':
+                    frame = observations_to_image(
+                        {"rgb": observations["rgb"]}, info)
+
+                    frame = append_text_to_image(
+                        frame, f'closest_object_name: {episode.object_category}_{episode.info["closest_goal_object_id"]}; object_center: [{closest_goal_object_position}]'
+                    )
+
+                    position = env.sim.get_agent_state(0).position
+                    sim_agent_position_str = ', '.join(
+                        [f'{x:.2f}' for x in position])
+
+                    frame = append_text_to_image(
+                        frame, f'action: {data["action"]}; position: [{sim_agent_position_str}]'
+                    )
+
+                    frame = append_text_to_image(
+                        frame, f'success {info["success"]}; spl: {info["spl"]}; distance2goal({distance_to}): {info["distance_to_goal"]:.2f} '
+                    )
+
+                    observation_list.append(frame)
+                
+                # 如果action_name是STOP，则提前结束循环
+                if action_name == "STOP":
+                    break
+
+            if args.save_video == 'True' and (ep_id % args.save_video_interval == 0):
+                video_path = os.path.join(
+                    args.video_path, scene_name, episode.object_category, get_success_str(info['success']))
+                #video_name = f'{scene_name}_{episode.object_category}_{get_success_str(info["success"])}_spl-{info["spl"]:.2f}_step-{len(episode.reference_replay)}_id-{ep_id}'
+                video_name = f'{env.current_episode.episode_id}_step-{len(episode.reference_replay)}'
+                images_to_video(observation_list, video_path, video_name)
+            if args.save_metric == 'True':
+                metric_json = make_metrics(info, episode)
+                dataset['episodes'].append(metric_json)
+
+        if args.save_metric == 'True':
+            #json_path = os.path.join(args.metrics_path, f'{scene_name}.json')
+            #write_json(dataset, json_path)
+            #write_gzip(json_path, json_path)
+            json_gz_path = os.path.join(args.metrics_path, f'{scene_name}.json.gz')
+            json_str = json.dumps(dataset, indent=None)
+            with gzip.open(json_gz_path, 'wt', encoding='utf-8') as zipfile:
+                zipfile.write(json_str)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--traj_path", type=str,
+                        default="/root/NavDataGeneration/data/traj_datasets/objectnav/hm3d_v1_hd_l3mvn/episode_num_200-299")
+    parser.add_argument("--scene_name", type=str,
+                        default='wPLokgvCnuk', help="like 1S7LAXRdDqK")
+    parser.add_argument("--scene_type", type=str,
+                        default='hm3d_v1', help="hm3d_v1 or hm3d_v2")
+    parser.add_argument("--save_video", type=str,
+                        default='True', help="whether to save video or not")
+    parser.add_argument("--save_video_interval", type=int, default=1,
+                        help="the step of the episodes, like 2 means every two episodes")
+    # metric conclude success, spl, distance_to_goal etc.
+    parser.add_argument("--save_metric", type=str,
+                        default='False', help="whether to save metric or not")
+
+    args = parser.parse_args()
+
+    if args.save_video == 'True':
+        #args.video_path = args.traj_path.replace('content', 'content_videos')
+        args.video_path = "examples/ori/"
+        os.makedirs(args.video_path, exist_ok=True)
+
+    if args.save_metric == 'True':
+        args.metrics_path = args.traj_path.replace(
+            'content', 'content_metrics')
+        os.makedirs(args.metrics_path, exist_ok=True)
+
+    cfg = habitat.get_config(
+        f"NavTrajSampleGeneration/L3MVN/envs/habitat/configs/tasks/objectnav_{args.scene_type}.yaml")
+    cfg.defrost()
+    cfg.DATASET.DATA_PATH = os.path.join(args.traj_path, args.scene_name + '.json.gz')
+    #cfg.MAX_EPISODE_STEPS = 1000
+    cfg.ENVIRONMENT.MAX_EPISODE_STEPS = 3000
+    cfg.freeze()
+
+    traj_replay(args,cfg)
+
+if __name__ == "__main__":
+    main()
